@@ -25,9 +25,14 @@ EOF_MARKER = "<<<PROM_EOF>>>"
 MAX_ROUNDS = 80          # safety ceiling on continuation rounds
 MAX_TOTAL_CHARS = 4_000_000
 
+# Per-chunk read timeout for upstream streams. Set by app at startup (None =
+# the httpx client default, which is unbounded). A finite value fails fast on a
+# stalled node while never cutting a healthy generation (read resets per chunk).
+DEFAULT_TIMEOUT = None
+
 
 # ─────────────────────────── upstream helper ───────────────────────────
-async def call_upstream_json(client, url, headers, body):
+async def call_upstream_json(client, url, headers, body, timeout=None):
     """Call upstream with stream=TRUE (mirroring Hermes) and REASSEMBLE the SSE
     into a non-streaming response dict. stream=true gives consistent NATIVE
     tool_calls; stream=false yields messy textual <tool_call>/python-fence formats.
@@ -37,13 +42,14 @@ async def call_upstream_json(client, url, headers, body):
     b = dict(body)
     b["stream"] = True
     b["stream_options"] = {"include_usage": True}
+    to = timeout if timeout is not None else DEFAULT_TIMEOUT
 
     content_parts = []
     tool_acc = {}          # index -> {"id","name","args"}
     finish = None
     usage = None
     try:
-        async with client.stream("POST", url, headers=headers, json=b) as r:
+        async with client.stream("POST", url, headers=headers, json=b, timeout=to) as r:
             if r.status_code != 200:
                 raw = await r.aread()
                 try:

@@ -23,6 +23,10 @@ You point your client's `base_url` at the proxy instead of at the provider. Noth
 
 The provider's cap is never written down anywhere in the code. The proxy just keeps going while the output keeps truncating, so if the cap changes (Gonka already moved it from 3k to 4096 at some point) nothing here needs touching. It also doesn't care which model you use, since it only deals with the OpenAI wire format.
 
+One thing worth knowing: clients often send a small fixed `max_tokens` (mine was pinned at 4096 to match the old cap), and if the proxy just forwarded that, it would split answers at 4096 even on a provider that could return far more in one shot. So on the first call the proxy asks for a large output instead (`PROM_MAX_TOKENS`, 32000 by default). The only thing that actually limits a single call is then the provider's real cap. Today that's still 4096 and the continuation does its job; the day the cap goes up to 16k, a 12k answer just comes back whole and nothing gets stitched. Whenever the output does get cut you'll see the observed cap logged, so you can tell what the provider is currently doing.
+
+The upstream timeout is a per-chunk read timeout (`PROM_READ_TIMEOUT`, 300s) rather than a total one. A healthy long generation keeps streaming tokens so it's never cut, while a node that goes silent fails fast and lets the client retry instead of hanging forever.
+
 Rough shape of it:
 
 ```

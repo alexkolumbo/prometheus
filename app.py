@@ -33,10 +33,35 @@ UPSTREAM = os.environ.get("UPSTREAM_BASE_URL", "https://proxy.gonka.gg").rstrip(
 PORT = int(os.environ.get("PORT", "8780"))
 LOGDIR = os.environ.get("LOGDIR", "/log")
 HEARTBEAT_SECS = float(os.environ.get("HEARTBEAT_SECS", "15"))
+
+# ── dynamic output + timeout (all env-configurable) ──────────────────────
+# PROM_MAX_TOKENS: how many output tokens we REQUEST upstream per call. We ask
+# for a large value on purpose so the provider returns as much as it can in ONE
+# call — the only real limiter becomes the provider's CURRENT output cap. Today
+# that cap is ~4096 (continuation stitches the rest seamlessly); if/when it is
+# raised (e.g. to 16k), a whole ≤16k answer comes back in a single call with
+# finish_reason=stop and is no longer split. No cap is ever hardcoded. A small
+# client max_tokens never shrinks this — delivering the full answer is the
+# proxy's whole job. Set PROM_MAX_TOKENS=0 to disable the boost (pure passthrough).
+PROM_MAX_TOKENS = int(os.environ.get("PROM_MAX_TOKENS", "32000"))
+# Upstream timeouts (seconds). read = max silence BETWEEN streamed chunks: a big
+# but healthy generation streams steadily and is never cut (total time scales
+# with output on its own), while a stalled node fails fast so Hermes can retry.
+PROM_CONNECT_TIMEOUT = float(os.environ.get("PROM_CONNECT_TIMEOUT", "15"))
+PROM_READ_TIMEOUT = float(os.environ.get("PROM_READ_TIMEOUT", "300"))
+PROM_WRITE_TIMEOUT = float(os.environ.get("PROM_WRITE_TIMEOUT", "60"))
 os.makedirs(LOGDIR, exist_ok=True)
+
+
+def _upstream_timeout():
+    return httpx.Timeout(connect=PROM_CONNECT_TIMEOUT, read=PROM_READ_TIMEOUT,
+                         write=PROM_WRITE_TIMEOUT, pool=PROM_CONNECT_TIMEOUT)
+
 
 app = FastAPI()
 client = httpx.AsyncClient(timeout=httpx.Timeout(None))
+# Apply the finite per-chunk read timeout to every upstream stream call.
+engine.DEFAULT_TIMEOUT = _upstream_timeout()
 
 HOP = {
     "host", "content-length", "connection", "keep-alive", "transfer-encoding",
@@ -66,7 +91,17 @@ async def healthz():
 async def orchestrate(data: dict, headers: dict):
     """Run the (possibly continuing) request. Returns (content, tool_calls, finish, usage, error)."""
     url = f"{UPSTREAM}/v1/chat/completions"
-    status, resp = await engine.call_upstream_json(client, url, headers, data)
+    # Dynamic output: request a large max_tokens so the provider returns all it
+    # can in one call. Only the provider's real cap limits us — when it rises,
+    # answers stop being split. (PROM_MAX_TOKENS=0 disables the boost.)
+    up_body = dict(data)
+    client_max = int(data.get("max_tokens") or 0)
+    eff_max = max(client_max, PROM_MAX_TOKENS) if PROM_MAX_TOKENS else (client_max or None)
+    if eff_max:
+        up_body["max_tokens"] = eff_max
+    log(f"first upstream call: max_tokens={eff_max} (client asked {client_max or 'none'})")
+    status, resp = await engine.call_upstream_json(client, url, headers, up_body,
+                                                   timeout=_upstream_timeout())
     if status != 200:
         log(f"upstream non-200 ({status})")
         return None, None, "error", {}, resp
@@ -77,6 +112,11 @@ async def orchestrate(data: dict, headers: dict):
     usage = resp.get("usage") or {}
     content = msg.get("content") or ""
     tool_calls = msg.get("tool_calls") or []
+    if fr == "length":
+        ct = (usage or {}).get("completion_tokens")
+        if ct:
+            log(f"OBSERVED provider per-call output cap ~= {ct} tokens "
+                f"(finish=length; will continue)")
 
     async def reconstruct_write_file(args_or_block):
         path, partial, _ = engine.parse_write_file_args(args_or_block)
