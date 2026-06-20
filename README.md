@@ -2,6 +2,8 @@
 
 A little proxy that you put in front of an OpenAI-compatible inference endpoint to get around a hard limit on output length.
 
+It's one of the pieces in [hermes-stack](https://github.com/alexkolumbo/hermes-stack), a one-script setup that wires it up behind Hermes alongside the memory layer and the dashboard — but it works on its own just as well.
+
 Some providers cap how many tokens a single response can contain. Gonka, which is what I built this for, cuts every response off at 4096 tokens. For chat that's fine. The problem shows up the moment an agent tries to write a real file.
 
 ## why this exists
