@@ -70,6 +70,16 @@ PROM_RETRY_TEMPERATURE = float(os.environ.get("PROM_RETRY_TEMPERATURE", "0.7"))
 PROM_RETRY_BACKOFF = float(os.environ.get("PROM_RETRY_BACKOFF", "1.0"))
 PROM_ERROR_TEXT = os.environ.get(
     "PROM_ERROR_TEXT", "The model is momentarily unavailable. Please try again in a moment.")
+
+# ── fallback provider (e.g. Grok / xAI) ──────────────────────────────────
+# Tried after the PRIMARY upstream has exhausted its retries (provider down,
+# overloaded, or still degenerate). Keeps the bot answering when Gonka is out.
+# Needs PROM_FALLBACK_KEY to be enabled; the fallback's own output still goes
+# through the degeneration guard.
+PROM_FALLBACK_URL = os.environ.get("PROM_FALLBACK_URL", "https://api.x.ai/v1").rstrip("/")
+PROM_FALLBACK_KEY = os.environ.get("PROM_FALLBACK_KEY", "")
+PROM_FALLBACK_MODEL = os.environ.get("PROM_FALLBACK_MODEL", "grok-4")
+PROM_FALLBACK_TRIES = int(os.environ.get("PROM_FALLBACK_TRIES", "2"))
 os.makedirs(LOGDIR, exist_ok=True)
 
 
@@ -101,6 +111,19 @@ def _build_up_body(data, attempt):
         b["presence_penalty"] = PROM_RETRY_PRESENCE_PENALTY
         b["temperature"] = PROM_RETRY_TEMPERATURE
     return b, eff_max, client_max
+
+
+def _total_attempts():
+    return (PROM_GUARD_RETRIES + 1) + (PROM_FALLBACK_TRIES if PROM_FALLBACK_KEY else 0)
+
+
+def _attempt_target(attempt, headers):
+    """(url, headers, model_override, is_fallback) for attempt N: the primary
+    upstream first, then the fallback provider once the primary's tries run out."""
+    if attempt < PROM_GUARD_RETRIES + 1 or not PROM_FALLBACK_KEY:
+        return f"{UPSTREAM}/v1/chat/completions", headers, None, False
+    fh = {"Authorization": "Bearer " + PROM_FALLBACK_KEY, "Content-Type": "application/json"}
+    return f"{PROM_FALLBACK_URL}/chat/completions", fh, PROM_FALLBACK_MODEL, True
 
 
 app = FastAPI()
@@ -141,23 +164,31 @@ async def orchestrate(data: dict, headers: dict):
     # repetition/CJK-garbage collapse, retry (a re-roll is almost always clean).
     recent = _recent_input(data)
     resp = ch = msg = None
-    for attempt in range(PROM_GUARD_RETRIES + 1):
+    total = _total_attempts()
+    for attempt in range(total):
+        turl, theaders, tmodel, is_fb = _attempt_target(attempt, headers)
         up_body, eff_max, client_max = _build_up_body(data, attempt)
-        log(f"upstream call attempt={attempt} max_tokens={eff_max} (client asked {client_max or 'none'})")
-        status, resp = await engine.call_upstream_json(client, url, headers, up_body,
+        if tmodel:
+            up_body["model"] = tmodel
+        log(f"upstream call attempt={attempt}{' FALLBACK' if is_fb else ''} "
+            f"max_tokens={eff_max} (client asked {client_max or 'none'})")
+        status, resp = await engine.call_upstream_json(client, turl, theaders, up_body,
                                                        timeout=_upstream_timeout())
         if status != 200:
             log(f"upstream non-200 ({status}) attempt={attempt}")
-            if attempt < PROM_GUARD_RETRIES:
+            if attempt < total - 1:
                 await asyncio.sleep(PROM_RETRY_BACKOFF * (attempt + 1))
                 continue
             return PROM_ERROR_TEXT, [], "stop", {}, None
         ch = (resp.get("choices") or [{}])[0]
         msg = ch.get("message") or {}
         content = msg.get("content") or ""
-        if content and engine.is_degenerate(content, recent) and attempt < PROM_GUARD_RETRIES:
-            log(f"GUARD degenerate output (len={len(content)}) — retry {attempt + 1}/{PROM_GUARD_RETRIES}")
+        if content and engine.is_degenerate(content, recent) and attempt < total - 1:
+            log("GUARD degenerate output — retry")
             continue
+        url, headers = turl, theaders            # winner — used by any continuation below
+        if tmodel:
+            data = {**data, "model": tmodel}
         break
 
     fr = ch.get("finish_reason")
@@ -271,21 +302,27 @@ async def stream_chat(data: dict, headers: dict, model: str):
 
     yield _chunk(base, {"role": "assistant"})
 
-    for attempt in range(PROM_GUARD_RETRIES + 1):
+    win = None
+    for attempt in range(_total_attempts()):
+        turl, theaders, tmodel, is_fb = _attempt_target(attempt, headers)
+        last = attempt >= _total_attempts() - 1
         up_body, eff_max, client_max = _build_up_body(data, attempt)
         up_body["stream"] = True
         up_body["stream_options"] = {"include_usage": True}
-        log(f"STREAM chat attempt={attempt} max_tokens={eff_max} (client asked {client_max or 'none'})")
+        if tmodel:
+            up_body["model"] = tmodel
+        log(f"STREAM chat attempt={attempt}{' FALLBACK' if is_fb else ''} "
+            f"max_tokens={eff_max} (client asked {client_max or 'none'})")
         if not committed:
             content_parts, tool_acc, finish, usage = [], {}, None, None
         prefix, degenerate = [], False
         try:
-            async with client.stream("POST", url, headers=headers, json=up_body,
+            async with client.stream("POST", turl, headers=theaders, json=up_body,
                                      timeout=_upstream_timeout()) as r:
                 if r.status_code != 200:
                     raw = (await r.aread()).decode("utf-8", "replace")
                     log(f"STREAM upstream non-200 ({r.status_code}) attempt={attempt} {raw[:160]}")
-                    if not committed and attempt < PROM_GUARD_RETRIES:
+                    if not committed and not last:
                         await asyncio.sleep(PROM_RETRY_BACKOFF * (attempt + 1))
                         continue
                     if not committed:
@@ -319,7 +356,7 @@ async def stream_chat(data: dict, headers: dict, model: str):
                             prefix.append(piece)
                             if sum(len(p) for p in prefix) >= PROM_GUARD_PREFIX:
                                 joined = "".join(prefix)
-                                if engine.is_degenerate(joined, recent) and attempt < PROM_GUARD_RETRIES:
+                                if engine.is_degenerate(joined, recent):
                                     degenerate = True
                                     break
                                 committed = True
@@ -338,7 +375,7 @@ async def stream_chat(data: dict, headers: dict, model: str):
                         finish = c0["finish_reason"]
         except Exception as ex:
             log(f"STREAM error: {ex!r} attempt={attempt}")
-            if not committed and attempt < PROM_GUARD_RETRIES:
+            if not committed and not last:
                 await asyncio.sleep(PROM_RETRY_BACKOFF * (attempt + 1))
                 continue
             if not committed:
@@ -348,17 +385,29 @@ async def stream_chat(data: dict, headers: dict, model: str):
             return
 
         if degenerate:
-            log(f"STREAM GUARD degenerate prefix — retry {attempt + 1}/{PROM_GUARD_RETRIES}")
+            log(f"STREAM GUARD degenerate prefix — retry {attempt + 1}")
             continue
         if not committed:
             short = "".join(content_parts)
-            if short and engine.is_degenerate(short, recent) and attempt < PROM_GUARD_RETRIES:
-                log(f"STREAM GUARD degenerate short output — retry {attempt + 1}/{PROM_GUARD_RETRIES}")
+            no_output = (not short) and (not tool_acc)
+            if not last and (no_output or (short and engine.is_degenerate(short, recent))):
+                log(f"STREAM retry attempt {attempt + 1} (empty or degenerate)")
                 continue
             committed = True
             if short:
                 yield _chunk(base, {"content": short})
+        win = (turl, theaders, tmodel)
         break
+
+    if win:
+        url, headers = win[0], win[1]
+        if win[2]:
+            data = {**data, "model": win[2]}
+    elif not committed:
+        yield _chunk(base, {"content": PROM_ERROR_TEXT})
+        yield _chunk(base, {}, "stop")
+        yield b"data: [DONE]\n\n"
+        return
 
     content = "".join(content_parts)
     tool_calls = []
