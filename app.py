@@ -64,6 +64,12 @@ PROM_GUARD_PREFIX = int(os.environ.get("PROM_GUARD_PREFIX_CHARS", "400"))
 PROM_RETRY_FREQ_PENALTY = float(os.environ.get("PROM_RETRY_FREQ_PENALTY", "0.5"))
 PROM_RETRY_PRESENCE_PENALTY = float(os.environ.get("PROM_RETRY_PRESENCE_PENALTY", "0.5"))
 PROM_RETRY_TEMPERATURE = float(os.environ.get("PROM_RETRY_TEMPERATURE", "0.7"))
+# Pause between retries so a brief provider blip (a dropped connection for a
+# second) is ridden out instead of burning all retries instantly. And show a
+# friendly line — not a raw exception — if every attempt still fails.
+PROM_RETRY_BACKOFF = float(os.environ.get("PROM_RETRY_BACKOFF", "1.0"))
+PROM_ERROR_TEXT = os.environ.get(
+    "PROM_ERROR_TEXT", "The model is momentarily unavailable. Please try again in a moment.")
 os.makedirs(LOGDIR, exist_ok=True)
 
 
@@ -141,8 +147,11 @@ async def orchestrate(data: dict, headers: dict):
         status, resp = await engine.call_upstream_json(client, url, headers, up_body,
                                                        timeout=_upstream_timeout())
         if status != 200:
-            log(f"upstream non-200 ({status})")
-            return None, None, "error", {}, resp
+            log(f"upstream non-200 ({status}) attempt={attempt}")
+            if attempt < PROM_GUARD_RETRIES:
+                await asyncio.sleep(PROM_RETRY_BACKOFF * (attempt + 1))
+                continue
+            return PROM_ERROR_TEXT, [], "stop", {}, None
         ch = (resp.get("choices") or [{}])[0]
         msg = ch.get("message") or {}
         content = msg.get("content") or ""
@@ -275,10 +284,12 @@ async def stream_chat(data: dict, headers: dict, model: str):
                                      timeout=_upstream_timeout()) as r:
                 if r.status_code != 200:
                     raw = (await r.aread()).decode("utf-8", "replace")
-                    log(f"STREAM upstream non-200 ({r.status_code})")
+                    log(f"STREAM upstream non-200 ({r.status_code}) attempt={attempt} {raw[:160]}")
                     if not committed and attempt < PROM_GUARD_RETRIES:
+                        await asyncio.sleep(PROM_RETRY_BACKOFF * (attempt + 1))
                         continue
-                    yield _chunk(base, {"content": f"[prometheus upstream {r.status_code}] {raw[:400]}"})
+                    if not committed:
+                        yield _chunk(base, {"content": PROM_ERROR_TEXT})
                     yield _chunk(base, {}, "stop")
                     yield b"data: [DONE]\n\n"
                     return
@@ -326,10 +337,12 @@ async def stream_chat(data: dict, headers: dict, model: str):
                     if c0.get("finish_reason"):
                         finish = c0["finish_reason"]
         except Exception as ex:
-            log(f"STREAM error: {ex!r}")
+            log(f"STREAM error: {ex!r} attempt={attempt}")
             if not committed and attempt < PROM_GUARD_RETRIES:
+                await asyncio.sleep(PROM_RETRY_BACKOFF * (attempt + 1))
                 continue
-            yield _chunk(base, {"content": f"\n[prometheus stream error] {ex!r}"})
+            if not committed:
+                yield _chunk(base, {"content": PROM_ERROR_TEXT})
             yield _chunk(base, {}, "stop")
             yield b"data: [DONE]\n\n"
             return
