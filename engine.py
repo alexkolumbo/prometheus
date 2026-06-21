@@ -148,6 +148,27 @@ def find_truncated_write_file(tool_calls):
     return None
 
 
+def is_degenerate(text, recent_input=""):
+    """Heuristic detector for model degeneration (repetition collapse / language
+    leak) so the proxy can RETRY instead of relaying garbage to the client.
+
+    Two signals: (1) a flood of CJK characters in the output while the request
+    itself wasn't CJK (the classic Kimi/Qwen 'Chinese garbage' leak), and
+    (2) a collapsed unique-token ratio over many tokens (a repeated-word loop)."""
+    t = text or ""
+    if len(t) < 80:
+        return False
+    cjk = sum(1 for x in t if "一" <= x <= "鿿")
+    ri = recent_input or ""
+    in_frac = (sum(1 for x in ri if "一" <= x <= "鿿") / len(ri)) if ri else 0.0
+    if cjk >= 20 and cjk / len(t) > 0.20 and in_frac < 0.10:
+        return True
+    toks = t.split()
+    if len(toks) >= 60 and len(set(toks)) / len(toks) < 0.18:
+        return True
+    return False
+
+
 def extract_tool_name(s: str):
     m = re.search(r'"name"\s*:\s*"([^"]+)"', s or "")
     return m.group(1) if m else None
