@@ -80,6 +80,13 @@ PROM_FALLBACK_URL = os.environ.get("PROM_FALLBACK_URL", "https://api.x.ai/v1").r
 PROM_FALLBACK_KEY = os.environ.get("PROM_FALLBACK_KEY", "")
 PROM_FALLBACK_MODEL = os.environ.get("PROM_FALLBACK_MODEL", "grok-4")
 PROM_FALLBACK_TRIES = int(os.environ.get("PROM_FALLBACK_TRIES", "2"))
+# Auth for the fallback: a static key (PROM_FALLBACK_KEY) OR reuse the OAuth token
+# the agent already holds. With PROM_FALLBACK_AUTH=oauth we read the current
+# access_token out of the agent's auth file (mounted read-only). The agent keeps
+# that token refreshed, so the proxy never has to do the OAuth dance itself.
+PROM_FALLBACK_AUTH = os.environ.get("PROM_FALLBACK_AUTH", "")   # "" | "oauth"
+PROM_FALLBACK_AUTH_FILE = os.environ.get("PROM_FALLBACK_AUTH_FILE", "/hermes-auth/auth.json")
+PROM_FALLBACK_PROVIDER = os.environ.get("PROM_FALLBACK_PROVIDER", "xai-oauth")
 os.makedirs(LOGDIR, exist_ok=True)
 
 
@@ -99,30 +106,55 @@ def _recent_input(data):
     return ""
 
 
-def _build_up_body(data, attempt):
-    """Upstream body for attempt N. attempt>0 nudges sampling to break a loop."""
+def _build_up_body(data, attempt, is_fallback=False):
+    """Upstream body for attempt N. A non-fallback retry (attempt>0) nudges
+    sampling to break a degeneration loop; the fallback provider gets a clean
+    body (e.g. Grok rejects the penalty params)."""
     b = dict(data)
     client_max = int(data.get("max_tokens") or 0)
     eff_max = max(client_max, PROM_MAX_TOKENS) if PROM_MAX_TOKENS else (client_max or None)
     if eff_max:
         b["max_tokens"] = eff_max
-    if attempt > 0:
+    if attempt > 0 and not is_fallback:
         b["frequency_penalty"] = PROM_RETRY_FREQ_PENALTY
         b["presence_penalty"] = PROM_RETRY_PRESENCE_PENALTY
         b["temperature"] = PROM_RETRY_TEMPERATURE
     return b, eff_max, client_max
 
 
+def _read_oauth_token():
+    """Current access_token for the OAuth fallback provider, from the agent's
+    auth file (which the agent keeps refreshed). None if unreadable/missing."""
+    try:
+        d = json.load(open(PROM_FALLBACK_AUTH_FILE))
+        cred = (d.get("providers") or {}).get(PROM_FALLBACK_PROVIDER) or {}
+        return (cred.get("tokens") or {}).get("access_token") or cred.get("access_token")
+    except Exception as e:
+        log(f"oauth fallback token read failed: {e!r}")
+        return None
+
+
+def _fallback_enabled():
+    return bool(PROM_FALLBACK_KEY) or PROM_FALLBACK_AUTH == "oauth"
+
+
 def _total_attempts():
-    return (PROM_GUARD_RETRIES + 1) + (PROM_FALLBACK_TRIES if PROM_FALLBACK_KEY else 0)
+    return (PROM_GUARD_RETRIES + 1) + (PROM_FALLBACK_TRIES if _fallback_enabled() else 0)
 
 
 def _attempt_target(attempt, headers):
     """(url, headers, model_override, is_fallback) for attempt N: the primary
     upstream first, then the fallback provider once the primary's tries run out."""
-    if attempt < PROM_GUARD_RETRIES + 1 or not PROM_FALLBACK_KEY:
+    if attempt < PROM_GUARD_RETRIES + 1 or not _fallback_enabled():
         return f"{UPSTREAM}/v1/chat/completions", headers, None, False
-    fh = {"Authorization": "Bearer " + PROM_FALLBACK_KEY, "Content-Type": "application/json"}
+    if PROM_FALLBACK_AUTH == "oauth":
+        tok = _read_oauth_token()
+        if not tok:                       # no token -> just retry the primary
+            return f"{UPSTREAM}/v1/chat/completions", headers, None, False
+        key = tok
+    else:
+        key = PROM_FALLBACK_KEY
+    fh = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
     return f"{PROM_FALLBACK_URL}/chat/completions", fh, PROM_FALLBACK_MODEL, True
 
 
@@ -167,7 +199,7 @@ async def orchestrate(data: dict, headers: dict):
     total = _total_attempts()
     for attempt in range(total):
         turl, theaders, tmodel, is_fb = _attempt_target(attempt, headers)
-        up_body, eff_max, client_max = _build_up_body(data, attempt)
+        up_body, eff_max, client_max = _build_up_body(data, attempt, is_fb)
         if tmodel:
             up_body["model"] = tmodel
         log(f"upstream call attempt={attempt}{' FALLBACK' if is_fb else ''} "
@@ -306,7 +338,7 @@ async def stream_chat(data: dict, headers: dict, model: str):
     for attempt in range(_total_attempts()):
         turl, theaders, tmodel, is_fb = _attempt_target(attempt, headers)
         last = attempt >= _total_attempts() - 1
-        up_body, eff_max, client_max = _build_up_body(data, attempt)
+        up_body, eff_max, client_max = _build_up_body(data, attempt, is_fb)
         up_body["stream"] = True
         up_body["stream_options"] = {"include_usage": True}
         if tmodel:
